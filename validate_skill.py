@@ -1,347 +1,439 @@
 #!/usr/bin/env python3
 """
-validate_skill.py — SKILL.md validator for Perplexity Computer skills.
+Skill Validation — validate_skill.py (v2)
 
-Validates SKILL.md files against the Agent Skills specification
-(https://agentskills.io/specification), Perplexity Computer upload
-constraints, and description-quality heuristics from Perplexity's
-engineering guide ("Designing, Refining, and Maintaining Agent Skills").
+Validates SKILL.md files against the Agent Skills spec (agentskills.io) and
+Perplexity Computer upload requirements. Companion to the skill-validator
+checklist (skills/skill-validator/SKILL.md); each finding carries the check
+code from that document.
+
+Key classes:
+    Finding: A single check result with code, severity, message, and line.
+    SkillReport: Aggregated findings for one validated file.
+
+Dependencies:
+    - PyYAML (full frontmatter validation; falls back to a shallow parser)
 
 Exit codes:
     0  all checks passed (warnings allowed unless --strict)
-    1  one or more ERROR-severity findings (or warnings in --strict mode)
+    1  one or more BLOCKER findings (or warnings in --strict mode)
     2  usage error / unreadable input
 
 Usage:
     python validate_skill.py path/to/SKILL.md
     python validate_skill.py path/to/skill-dir
     python validate_skill.py path/to/skills-root --recursive
-    python validate_skill.py SKILL.md --strict --json report.json --tools-file tools.json
+    python validate_skill.py skills/ --recursive --strict --json report.json
+    python validate_skill.py SKILL.md --tools-file tools.json
 """
+
+from __future__ import annotations
 
 import argparse
 import json
 import re
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
 
-NAME_MAX = 64
-DESC_MAX = 1024
-COMPAT_MAX = 500
-UPLOAD_MAX_BYTES = 10 * 1024 * 1024          # Perplexity Computer upload limit
-BODY_LINE_RECOMMENDED_MAX = 500              # spec: keep SKILL.md under 500 lines
-DESC_WORD_RECOMMENDED_MAX = 50               # Perplexity guide: target <= 50 words
+try:
+    import yaml
+    HAVE_YAML = True
+except ImportError:
+    HAVE_YAML = False
+
+MAX_UPLOAD_BYTES = 10 * 1024 * 1024   # Perplexity Computer hard cap
+MAX_DESCRIPTION_CHARS = 1024
+TARGET_DESCRIPTION_WORDS = 50
+MIN_DESCRIPTION_CHARS = 20
+MAX_NAME_CHARS = 64
+MAX_BODY_LINES = 500
+MAX_BODY_TOKENS = 5000                # estimated as chars / 4
+MAX_COMPATIBILITY_CHARS = 500
+MAX_LICENSE_CHARS = 100
+
+# One regex enforcing charset, no leading/trailing hyphen, no doubles (N004)
 NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
-SPEC_FIELDS = {"name", "description", "license", "compatibility", "metadata", "allowed-tools"}
-EXTENSION_FIELDS = {"depends", "disable-model-invocation"}  # Perplexity `depends:` + common client extensions
+SPEC_FIELDS = {"name", "description", "license", "compatibility",
+               "metadata", "allowed-tools"}
+KNOWN_EXTENSIONS = {"depends", "disable-model-invocation"}  # Perplexity `depends:` + client extensions
 
-ERROR, WARN, INFO = "ERROR", "WARNING", "INFO"
+TRIGGER_PHRASES = ("use when", "load when", "use for", "use this")
 
-# Tool names vary between agent implementations; treat unknowns as WARNING and
-# maintain this registry (or pass --tools-file tools.json with a JSON list).
+# Generic cross-client defaults; override with --tools-file for your client.
 DEFAULT_KNOWN_TOOLS = {
-    "load_skill", "search", "web_search", "fetch_url", "browse",
-    "code_interpreter", "execute_python", "run_command", "bash", "Bash",
-    "read_file", "write_file", "list_files", "create_file", "Read", "Write", "Grep", "Glob",
+    # Claude Code
+    "Bash", "Read", "Write", "Edit", "Glob", "Grep", "Task", "TodoWrite",
+    "WebSearch", "WebFetch", "NotebookEdit",
+    # Agent Skills runtime
+    "load_skill",
+    # Perplexity-flavoured names
+    "search", "web_search", "fetch_url", "browse",
+    "code_interpreter", "execute_python", "run_command", "bash",
+    "read_file", "write_file", "list_files", "create_file",
 }
 
-
-def find(check_id, severity, message):
-    return {"check": check_id, "severity": severity, "message": message}
+BLOCKER, WARN, INFO = "BLOCKER", "WARN", "INFO"
 
 
-def coerce_scalar(val):
-    v = val.strip()
-    if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
-        return v[1:-1]
-    low = v.lower()
-    if low in ("true", "yes", "on"):
-        return True
-    if low in ("false", "no", "off"):
-        return False
-    if low in ("null", "~", ""):
+@dataclass
+class Finding:
+    code: str
+    severity: str  # BLOCKER | WARN | INFO
+    message: str
+    line: int | None = None
+
+
+@dataclass
+class SkillReport:
+    path: str
+    findings: list[Finding] = field(default_factory=list)
+
+    def add(self, code, severity, message, line=None):
+        self.findings.append(Finding(code, severity, message, line))
+
+    @property
+    def blockers(self):
+        return [f for f in self.findings if f.severity == BLOCKER]
+
+    @property
+    def warnings(self):
+        return [f for f in self.findings if f.severity == WARN]
+
+    @property
+    def infos(self):
+        return [f for f in self.findings if f.severity == INFO]
+
+
+def split_frontmatter(text: str):
+    """Return (frontmatter_text, body_text, close_line) or (None, text, None)."""
+    if text.startswith("\ufeff"):
+        text = text[1:]
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return None, text, None
+    for i in range(1, len(lines)):
+        if lines[i].strip() in ("---", "..."):
+            return "\n".join(lines[1:i]), "\n".join(lines[i + 1:]), i + 1
+    return None, text, None
+
+
+def parse_frontmatter(fm_text: str, report: SkillReport):
+    """Parse frontmatter into a dict, recording Y-codes. None on hard failure."""
+    if not fm_text.strip():
+        report.add("Y002", BLOCKER, "Frontmatter block is empty")
         return None
-    try:
-        return int(v)
-    except ValueError:
-        pass
-    try:
-        return float(v)
-    except ValueError:
-        pass
-    return v
-
-
-def mini_yaml_load(text):
-    """Fallback parser for simple frontmatter when PyYAML is unavailable.
-    Handles flat `key: value`, one-level nested maps, and `- item` lists."""
-    data, lines, i = {}, text.split("\n"), 0
-    while i < len(lines):
-        raw = lines[i]; i += 1
-        if not raw.strip() or raw.strip().startswith("#"):
-            continue
-        if raw[0] in (" ", "\t"):
-            raise ValueError(f"unexpected indentation at line {i}: {raw!r}")
-        if ":" not in raw:
-            raise ValueError(f"cannot parse line {i}: {raw!r}")
-        key, _, val = raw.partition(":")
-        key, val = key.strip(), val.strip()
-        if val:
-            data[key] = coerce_scalar(val)
-            continue
-        nested_map, nested_list = {}, []
-        while i < len(lines) and lines[i].strip() and lines[i][0] in (" ", "\t"):
-            sub = lines[i].strip(); i += 1
-            if sub.startswith("- "):
-                nested_list.append(coerce_scalar(sub[2:]))
-            elif ":" in sub:
-                k2, _, v2 = sub.partition(":")
-                nested_map[k2.strip()] = coerce_scalar(v2)
-            else:
-                raise ValueError(f"cannot parse nested line {i}: {sub!r}")
-        if nested_map and nested_list:
-            raise ValueError(f"mixed map/list under key {key!r}")
-        data[key] = nested_list if nested_list else (nested_map if nested_map else None)
+    if HAVE_YAML:
+        try:
+            data = yaml.safe_load(fm_text)
+        except yaml.YAMLError as exc:
+            report.add("Y003", BLOCKER, f"Frontmatter is not valid YAML: {exc}")
+            return None
+    else:
+        # Shallow fallback: enough to keep validating without PyYAML, but it
+        # cannot catch nested-type errors, so full validation needs PyYAML.
+        report.add("Y000", INFO,
+                   "PyYAML not installed; shallow frontmatter parse only")
+        data = {}
+        for lineno, raw in enumerate(fm_text.splitlines(), start=2):
+            if "\t" in raw:
+                report.add("Y003", BLOCKER,
+                           "Tab character in frontmatter (YAML forbids tabs)",
+                           line=lineno)
+                return None
+            if raw.strip() and ":" in raw:
+                key, _, value = raw.partition(":")
+                data[key.strip()] = value.strip().strip('"').strip("'")
+    if not isinstance(data, dict):
+        report.add("Y004", BLOCKER, "Frontmatter must be a YAML mapping")
+        return None
     return data
 
 
-def load_yaml(text):
-    try:
-        import yaml
-        return yaml.safe_load(text), None
-    except ImportError:
-        try:
-            return mini_yaml_load(text), "PyYAML not installed; used limited fallback parser (install pyyaml for full YAML support)"
-        except ValueError as e:
-            return None, f"YAML parse error (fallback parser): {e}"
-    except Exception as e:
-        return None, f"YAML parse error: {e}"
-
-
-def extract_frontmatter(text):
-    if text.startswith("\ufeff"):
-        text = text[1:]
-    lines = text.split("\n")
-    if not lines or lines[0].strip() != "---":
-        return None, text, "file must begin with a '---' frontmatter delimiter on line 1"
-    for i in range(1, len(lines)):
-        if lines[i].strip() in ("---", "..."):
-            return "\n".join(lines[1:i]), "\n".join(lines[i + 1:]), None
-    return None, text, "no closing '---' frontmatter delimiter found"
-
-
-def base_tool(token):
-    return token.split("(")[0].strip()
-
-
-def validate_file(path, known_tools, check_dir_name=True):
-    f = []
-    path = Path(path)
-    if not path.exists():
-        return [find("F000", ERROR, f"path does not exist: {path}")], None
-    if path.is_dir():
-        candidate = path / "SKILL.md"
-        if candidate.exists():
-            path = candidate
-        else:
-            return [find("F001", ERROR, f"no SKILL.md in directory {path} (expected {candidate}); use --recursive to scan a skills root")], None
-    if not path.is_file():
-        return [find("F001", ERROR, f"not a file: {path}")], None
-
-    size = path.stat().st_size
-    if size == 0:
-        return [find("F002", ERROR, "file is empty")], None
-    if size > UPLOAD_MAX_BYTES:
-        f.append(find("F003", ERROR, f"file is {size} bytes; Perplexity Computer upload limit is 10 MB"))
-    try:
-        text = path.read_text(encoding="utf-8")
-    except UnicodeDecodeError as e:
-        return [find("F004", ERROR, f"file is not valid UTF-8: {e}")], None
-
-    fm_text, body, err = extract_frontmatter(text)
-    if err:
-        f.append(find("Y001", ERROR, err))
-        return f, None
-    if not fm_text.strip():
-        f.append(find("Y002", ERROR, "frontmatter block is empty; 'name' and 'description' are required"))
-        return f, None
-
-    data, yaml_warn = load_yaml(fm_text)
-    if yaml_warn and data is None:
-        f.append(find("Y003", ERROR, yaml_warn))
-        return f, None
-    if yaml_warn:
-        f.append(find("Y003", WARN, yaml_warn))
-    if not isinstance(data, dict):
-        f.append(find("Y004", ERROR, f"frontmatter must be a YAML mapping, got {type(data).__name__}"))
-        return f, None
-
-    for key in data:
-        if key not in SPEC_FIELDS and key not in EXTENSION_FIELDS:
-            f.append(find("Y005", WARN, f"non-standard frontmatter field {key!r}; spec fields are {sorted(SPEC_FIELDS)} — confirm your client supports it"))
-
-    # --- name ---
+def check_name(data, path, report, check_dir_name=True):
     name = data.get("name")
     if name is None:
-        f.append(find("N001", ERROR, "missing required field 'name'"))
-    elif not isinstance(name, str):
-        f.append(find("N002", ERROR, f"'name' must be a string, got {type(name).__name__} ({name!r}); quote it if needed"))
-    else:
-        if not name:
-            f.append(find("N001", ERROR, "'name' is empty"))
-        if len(name) > NAME_MAX:
-            f.append(find("N003", ERROR, f"'name' is {len(name)} chars; max is {NAME_MAX}"))
-        if not NAME_RE.match(name):
-            detail = []
-            if any(c.isupper() for c in name):
-                detail.append("uppercase letters")
-            if re.search(r"[^a-zA-Z0-9-]", name):
-                detail.append("illegal characters (only a-z, 0-9, '-')")
-            if name.startswith("-") or name.endswith("-"):
-                detail.append("leading/trailing hyphen")
-            if "--" in name:
-                detail.append("consecutive hyphens")
-            f.append(find("N004", ERROR, f"'name' {name!r} is invalid: {', '.join(detail) or 'format'}"))
-        if check_dir_name and path.name == "SKILL.md" and path.parent.name not in ("", "."):
-            if name != path.parent.name:
-                f.append(find("N005", ERROR, f"'name' {name!r} must exactly match parent directory {path.parent.name!r}"))
-        if path.name != "SKILL.md":
-            f.append(find("N006", INFO, f"file is named {path.name!r}, not 'SKILL.md'; direct .md upload is allowed in Computer, but a skill directory must use SKILL.md"))
+        report.add("N001", BLOCKER, "Missing required field: name")
+        return
+    if not isinstance(name, str) or not name.strip():
+        report.add("N002", BLOCKER,
+                   f"name must be a non-empty string, got {type(name).__name__} "
+                   f"({name!r}); quote it if needed")
+        return
+    if not 1 <= len(name) <= MAX_NAME_CHARS:
+        report.add("N003", BLOCKER,
+                   f"name is {len(name)} chars; must be 1-{MAX_NAME_CHARS}")
+    if not NAME_RE.match(name):
+        detail = []
+        if any(c.isupper() for c in name):
+            detail.append("uppercase letters")
+        if re.search(r"[^a-zA-Z0-9-]", name):
+            detail.append("illegal characters (only a-z, 0-9, '-')")
+        if name.startswith("-") or name.endswith("-"):
+            detail.append("leading/trailing hyphen")
+        if "--" in name:
+            detail.append("consecutive hyphens")
+        report.add("N004", BLOCKER,
+                   f"name {name!r} must be lowercase a-z, 0-9, single hyphens "
+                   f"({', '.join(detail) or 'invalid format'})")
+    # N005 only applies to directory-packaged skills; bare .md is upload-only.
+    if check_dir_name and path.name == "SKILL.md" and path.parent.name not in ("", "."):
+        if name != path.parent.name:
+            report.add("N005", BLOCKER,
+                       f"name '{name}' does not match parent directory "
+                       f"'{path.parent.name}'")
 
-    # --- description ---
+
+def check_description(data, report):
     desc = data.get("description")
     if desc is None:
-        f.append(find("D001", ERROR, "missing required field 'description'"))
-    elif not isinstance(desc, str):
-        f.append(find("D002", ERROR, f"'description' must be a string, got {type(desc).__name__}"))
-    else:
-        if not desc.strip():
-            f.append(find("D001", ERROR, "'description' is empty"))
-        if len(desc) > DESC_MAX:
-            f.append(find("D003", ERROR, f"'description' is {len(desc)} chars; max is {DESC_MAX}"))
-        words = len(desc.split())
-        if words > DESC_WORD_RECOMMENDED_MAX:
-            f.append(find("D004", WARN, f"'description' is {words} words; Perplexity recommends <= {DESC_WORD_RECOMMENDED_MAX} (index costs ~100 tokens/skill in every session)"))
-        if 0 < len(desc.strip()) < 20:
-            f.append(find("D005", WARN, "'description' is very short (<20 chars); thin descriptions route unreliably"))
-        low = desc.lower()
-        if not any(p in low for p in ("use when", "load when", "use for", "use this")):
-            f.append(find("D006", INFO, "description has no trigger phrase ('Use when...'/'Load when...'); Perplexity treats the description as a routing trigger, not documentation"))
+        report.add("D001", BLOCKER, "Missing required field: description")
+        return
+    if not isinstance(desc, str) or not desc.strip():
+        report.add("D002", BLOCKER, "description must be a non-empty string")
+        return
+    if len(desc) > MAX_DESCRIPTION_CHARS:
+        report.add("D003", BLOCKER,
+                   f"description is {len(desc)} chars; max "
+                   f"{MAX_DESCRIPTION_CHARS}")
+    words = len(desc.split())
+    if words > TARGET_DESCRIPTION_WORDS:
+        report.add("D004", WARN,
+                   f"description is {words} words; target "
+                   f"<= {TARGET_DESCRIPTION_WORDS} (routing index is "
+                   f"~100 tokens/skill, paid every session)")
+    if len(desc) < MIN_DESCRIPTION_CHARS:
+        report.add("D005", WARN,
+                   f"description is very thin ({len(desc)} chars); the model "
+                   f"has little signal for routing")
+    if not any(p in desc.lower() for p in TRIGGER_PHRASES):
+        report.add("D006", WARN,
+                   "description lacks a trigger phrase ('Use when...' / "
+                   "'Load when...'); it should say when to load, not just "
+                   "what the skill does")
 
-    # --- allowed-tools ---
+
+def check_allowed_tools(data, report, known_tools):
     tools = data.get("allowed-tools")
-    if tools is not None:
-        tokens = []
-        if isinstance(tools, str):
-            if not tools.strip():
-                f.append(find("T001", WARN, "'allowed-tools' is an empty string; omit the field instead"))
-            tokens = tools.split()
-        elif isinstance(tools, list):
-            f.append(find("T002", WARN, "'allowed-tools' is a YAML list; the spec defines a space-separated string — normalize for cross-client compatibility"))
-            tokens = [str(t) for t in tools]
+    if tools is None:
+        return
+    if not isinstance(tools, str):
+        report.add("T001", WARN,
+                   "allowed-tools should be a space-separated string, not a "
+                   "YAML list (spec form; normalize for portability)")
+        if isinstance(tools, list):
+            tools = " ".join(str(t) for t in tools)  # still check the names
         else:
-            f.append(find("T001", ERROR, f"'allowed-tools' must be a space-separated string, got {type(tools).__name__}"))
-        for tok in tokens:
-            bt = base_tool(tok)
-            if not bt:
-                f.append(find("T003", WARN, f"empty tool token in 'allowed-tools': {tok!r}"))
-            elif bt not in known_tools:
-                f.append(find("T004", WARN, f"tool {bt!r} not in known-tools registry; verify it matches a tool Perplexity Computer actually exposes (update DEFAULT_KNOWN_TOOLS or pass --tools-file)"))
+            return
+    tokens = tools.split()
+    if not tokens:
+        report.add("T002", WARN, "allowed-tools is present but empty")
+        return
+    stripped_any = False
+    for token in tokens:
+        base = token.split("(", 1)[0]  # drop scoping e.g. Bash(git:*)
+        if base != token:
+            stripped_any = True
+        if not base:
+            report.add("T003", WARN, f"empty tool token: {token!r}")
+        elif base not in known_tools:
+            report.add("T003", WARN,
+                       f"tool '{base}' not in known-tools registry; pass "
+                       f"--tools-file if your client exposes it")
+    if stripped_any:
+        report.add("T004", INFO,
+                   "scoping prefixes like Bash(git:*) were stripped before "
+                   "registry lookup")
 
-    # --- optional fields ---
+
+def check_optional_fields(data, report):
     compat = data.get("compatibility")
     if compat is not None:
         if not isinstance(compat, str):
-            f.append(find("O001", ERROR, f"'compatibility' must be a string, got {type(compat).__name__}"))
-        elif len(compat) > COMPAT_MAX:
-            f.append(find("O002", ERROR, f"'compatibility' is {len(compat)} chars; max is {COMPAT_MAX}"))
-    meta = data.get("metadata")
-    if meta is not None:
-        if not isinstance(meta, dict):
-            f.append(find("O003", ERROR, f"'metadata' must be a map of string keys to string values, got {type(meta).__name__}"))
-        else:
-            for k, v in meta.items():
-                if not isinstance(k, str) or not isinstance(v, str):
-                    f.append(find("O004", WARN, f"metadata entry {k!r}: {v!r} is not a string:string pair"))
-    lic = data.get("license")
-    if lic is not None and not isinstance(lic, str):
-        f.append(find("O005", WARN, f"'license' should be a string, got {type(lic).__name__}"))
+            report.add("O001", BLOCKER, "compatibility must be a string")
+        elif len(compat) > MAX_COMPATIBILITY_CHARS:
+            report.add("O002", BLOCKER,
+                       f"compatibility is {len(compat)} chars; max "
+                       f"{MAX_COMPATIBILITY_CHARS}")
+    metadata = data.get("metadata")
+    if metadata is not None:
+        if not isinstance(metadata, dict) or not all(
+                isinstance(k, str) and isinstance(v, str)
+                for k, v in metadata.items()):
+            report.add("O003", WARN,
+                       "metadata must be a map of string keys to string values")
+        elif not metadata:
+            report.add("O004", WARN, "metadata map is empty; remove it")
+    license_ = data.get("license")
+    if license_ is not None and (not isinstance(license_, str)
+                                 or len(license_) > MAX_LICENSE_CHARS):
+        report.add("O005", WARN,
+                   "license should be a short string (name or bundled file)")
 
-    # --- body ---
-    body_lines = body.strip().split("\n") if body.strip() else []
+
+def check_body(body, report):
     if not body.strip():
-        f.append(find("B001", WARN, "markdown body is empty; the skill has no instructions to load"))
-    elif len(body_lines) > BODY_LINE_RECOMMENDED_MAX:
-        f.append(find("B002", WARN, f"body is {len(body_lines)} lines; spec recommends < {BODY_LINE_RECOMMENDED_MAX} — move detail to references/ for progressive disclosure"))
-    est_tokens = len(body) // 4
-    if est_tokens > 5000:
-        f.append(find("B003", WARN, f"body is ~{est_tokens} tokens; Perplexity recommends <= 5000 once loaded"))
+        report.add("B001", WARN,
+                   "Body is empty; after load the body is the only thing the "
+                   "model sees (Perplexity strips frontmatter)")
+        return
+    n_lines = len(body.splitlines())
+    if n_lines >= MAX_BODY_LINES:
+        report.add("B002", WARN,
+                   f"Body is {n_lines} lines; keep under {MAX_BODY_LINES} and "
+                   f"move detail to references/")
+    est_tokens = len(body) // 4  # ~4 chars/token heuristic
+    if est_tokens >= MAX_BODY_TOKENS:
+        report.add("B003", WARN,
+                   f"Body is ~{est_tokens} tokens; keep under "
+                   f"~{MAX_BODY_TOKENS}")
 
-    return f, {"name": name if isinstance(name, str) else None, "path": str(path)}
+
+def validate_file(path: Path, known_tools: set, check_dir_name=True) -> SkillReport:
+    report = SkillReport(path=str(path))
+
+    if path.name != "SKILL.md":
+        report.add("F001", INFO,
+                   f"Bare .md filename ({path.name!r}) is acceptable for "
+                   f"direct upload only; directory-packaged skills must use "
+                   f"SKILL.md")
+
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        report.add("F000", BLOCKER, f"Cannot read file: {exc}")
+        return report
+    if not raw:
+        report.add("F004", BLOCKER, "File is empty")
+        return report
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        report.add("F002", BLOCKER, f"File is not valid UTF-8: {exc}")
+        return report
+    if len(raw) > MAX_UPLOAD_BYTES:
+        report.add("F003", BLOCKER,
+                   f"File is {len(raw)} bytes; upload cap is 10 MB")
+
+    fm_text, body, _ = split_frontmatter(text)
+    if fm_text is None:
+        report.add("Y001", BLOCKER,
+                   "File must begin with '---' on line 1, closed by a "
+                   "second '---' (or '...')", line=1)
+        check_body(body, report)
+        return report
+
+    data = parse_frontmatter(fm_text, report)
+    if data is None:
+        check_body(body, report)
+        return report
+
+    unknown = set(data) - SPEC_FIELDS - KNOWN_EXTENSIONS
+    if unknown:
+        report.add("Y005", WARN,
+                   f"Non-spec frontmatter fields: {sorted(unknown)}; justify "
+                   f"or remove")
+
+    check_name(data, path, report, check_dir_name=check_dir_name)
+    check_description(data, report)
+    check_allowed_tools(data, report, known_tools)
+    check_optional_fields(data, report)
+    check_body(body, report)
+    return report
 
 
-def collect_targets(path, recursive):
-    path = Path(path)
+def collect_targets(path: Path, recursive: bool) -> list[Path]:
     if path.is_file():
         return [path]
-    if (path / "SKILL.md").exists():
-        return [path / "SKILL.md"]
+    if not path.is_dir():
+        return []
+    direct = path / "SKILL.md"
+    if direct.is_file() and not recursive:
+        return [direct]
     if recursive:
-        found = sorted(path.rglob("SKILL.md"))
-        return found
+        return sorted(path.rglob("SKILL.md")) or sorted(path.rglob("*.md"))
     return []
 
 
-def main(argv=None):
-    ap = argparse.ArgumentParser(description="Validate SKILL.md files for Perplexity Computer / Agent Skills spec.")
-    ap.add_argument("paths", nargs="+", help="SKILL.md file(s), skill directory, or skills root")
-    ap.add_argument("--recursive", action="store_true", help="scan directories recursively for SKILL.md files")
-    ap.add_argument("--strict", action="store_true", help="treat WARNINGs as failures (exit 1)")
-    ap.add_argument("--json", metavar="REPORT", help="write a JSON report to this path")
-    ap.add_argument("--tools-file", help="JSON file with a list of known tool names for allowed-tools checks")
-    ap.add_argument("--no-dir-check", action="store_true", help="skip the name-must-match-directory check")
+def print_report(report: SkillReport):
+    print(f"\n== {report.path}")
+    if not report.findings:
+        print("  PASS — no findings")
+        return
+    order = {BLOCKER: 0, WARN: 1, INFO: 2}
+    for f in sorted(report.findings, key=lambda x: order.get(x.severity, 3)):
+        loc = f":{f.line}" if f.line else ""
+        print(f"  [{f.severity:7}] {f.code}{loc} {f.message}")
+    print(f"  -> {len(report.blockers)} blocker(s), "
+          f"{len(report.warnings)} warning(s), {len(report.infos)} info")
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(
+        description="Validate SKILL.md files for Perplexity Computer.")
+    ap.add_argument("paths", nargs="+",
+                    help="SKILL.md file(s), skill directory, or repo root")
+    ap.add_argument("--recursive", action="store_true",
+                    help="Scan for skills under the given directories")
+    ap.add_argument("--strict", action="store_true",
+                    help="Treat warnings as failures (exit 1)")
+    ap.add_argument("--json", metavar="OUT",
+                    help="Write a JSON report to OUT")
+    ap.add_argument("--tools-file", metavar="JSON",
+                    help="JSON list of tool names exposed by your client")
+    ap.add_argument("--no-dir-check", action="store_true",
+                    help="Skip the name-must-match-directory check (N005)")
     args = ap.parse_args(argv)
 
     known_tools = set(DEFAULT_KNOWN_TOOLS)
     if args.tools_file:
         try:
-            known_tools = set(json.loads(Path(args.tools_file).read_text(encoding="utf-8")))
-        except (OSError, json.JSONDecodeError) as e:
-            print(f"error: cannot load --tools-file: {e}", file=sys.stderr)
+            known_tools |= set(json.loads(
+                Path(args.tools_file).read_text(encoding="utf-8")))
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"error: cannot load tools file: {exc}", file=sys.stderr)
             return 2
 
-    report, any_error, any_warn = {}, False, False
-    for raw in args.paths:
-        targets = collect_targets(raw, args.recursive)
+    reports: list[SkillReport] = []
+    for raw_arg in args.paths:
+        targets = collect_targets(Path(raw_arg), args.recursive)
         if not targets:
-            print(f"error: no SKILL.md found at {raw} (use --recursive to scan a skills root)", file=sys.stderr)
-            report[str(raw)] = [find("F001", ERROR, "no SKILL.md found")]
-            any_error = True
+            print(f"error: no SKILL.md found at {raw_arg} "
+                  f"(try --recursive for repos)", file=sys.stderr)
+            missing = SkillReport(path=raw_arg)
+            missing.add("F000", BLOCKER, "no SKILL.md found at this path")
+            reports.append(missing)
             continue
         for t in targets:
-            findings, _meta = validate_file(t, known_tools, check_dir_name=not args.no_dir_check)
-            report[str(t)] = findings
-            for x in findings:
-                any_error |= x["severity"] == ERROR
-                any_warn |= x["severity"] == WARN
+            reports.append(validate_file(t, known_tools,
+                                         check_dir_name=not args.no_dir_check))
 
-    for target, findings in report.items():
-        print(f"\n=== {target} ===")
-        if not findings:
-            print("  PASS — no findings")
-        for x in sorted(findings, key=lambda r: (r["severity"] != ERROR, r["severity"] != WARN)):
-            print(f"  [{x['severity']:7}] {x['check']}: {x['message']}")
+    for r in reports:
+        print_report(r)
 
-    n_err = sum(1 for fs in report.values() for x in fs if x["severity"] == ERROR)
-    n_warn = sum(1 for fs in report.values() for x in fs if x["severity"] == WARN)
-    n_info = sum(1 for fs in report.values() for x in fs if x["severity"] == INFO)
-    print(f"\nSummary: {len(report)} file(s), {n_err} error(s), {n_warn} warning(s), {n_info} info")
+    n_blockers = sum(len(r.blockers) for r in reports)
+    n_warnings = sum(len(r.warnings) for r in reports)
+    n_infos = sum(len(r.infos) for r in reports)
+    print(f"\n{len(reports)} file(s): {n_blockers} blocker(s), "
+          f"{n_warnings} warning(s), {n_infos} info")
 
     if args.json:
-        Path(args.json).write_text(json.dumps({"summary": {"files": len(report), "errors": n_err, "warnings": n_warn, "info": n_info}, "results": report}, indent=2), encoding="utf-8")
+        payload = {
+            "files": [{
+                "path": r.path,
+                "findings": [vars(f) for f in r.findings],
+                "blockers": len(r.blockers),
+                "warnings": len(r.warnings),
+                "info": len(r.infos),
+            } for r in reports],
+            "summary": {"files": len(reports), "blockers": n_blockers,
+                        "warnings": n_warnings, "info": n_infos},
+        }
+        Path(args.json).write_text(json.dumps(payload, indent=2),
+                                   encoding="utf-8")
 
-    if any_error or (args.strict and any_warn):
+    if n_blockers or (args.strict and n_warnings):
         return 1
     return 0
 
